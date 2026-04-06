@@ -1,0 +1,381 @@
+import json
+import csv
+import io
+import time
+import requests
+from datetime import datetime, timedelta, timezone
+
+import streamlit as st
+
+from config import (
+    CLIENT_ID, CLIENT_SECRET,
+    FRANCE_TRAVAIL_TOKEN_URL, FRANCE_TRAVAIL_SEARCH_URL,
+    DEPARTEMENTS, DEPT_LABELS,
+    SCORE_HIGH, SCORE_MODERATE, TOKEN_TTL,
+)
+from db import (
+    init_db, insert_job, insert_score, insert_review_queue,
+    update_review_status, get_leads, get_job_description,
+    get_stats, get_approved_leads_for_export,
+)
+from scorer import score_job
+from hypothesis import generate_hypothesis, generate_offer_angle
+
+# ── DB init on every cold start ───────────────────────────────────────────────
+init_db()
+
+st.set_page_config(page_title="Leads Automation — PACA", layout="wide")
+
+# ── Token cache (session-scoped) ──────────────────────────────────────────────
+if "ft_token" not in st.session_state:
+    st.session_state.ft_token = None
+    st.session_state.ft_token_expires = 0.0
+
+
+def get_token() -> str:
+    now = time.time()
+    if st.session_state.ft_token and now < st.session_state.ft_token_expires:
+        return st.session_state.ft_token
+
+    resp = requests.post(
+        FRANCE_TRAVAIL_TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "api_offresdemploiv2 o2dsoffre",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+    )
+    if resp.status_code == 401:
+        st.error("Erreur 401 — Identifiants France Travail invalides. Vérifiez vos secrets.")
+        st.stop()
+    resp.raise_for_status()
+    data = resp.json()
+    st.session_state.ft_token = data["access_token"]
+    st.session_state.ft_token_expires = now + TOKEN_TTL
+    return st.session_state.ft_token
+
+
+def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
+    listings = []
+    start = 0
+    page_size = 150
+
+    while True:
+        params = {
+            "departement": dept,
+            "minCreationDate": min_date,
+            "range": f"{start}-{start + page_size - 1}",
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = requests.get(
+            FRANCE_TRAVAIL_SEARCH_URL, params=params, headers=headers, timeout=20
+        )
+
+        if resp.status_code == 401:
+            log_fn(f"❌ [{dept}] Token expiré — rechargez la page pour rafraîchir.")
+            break
+
+        if resp.status_code == 429:
+            log_fn(f"⏳ [{dept}] Rate limit, retry dans 2s...")
+            time.sleep(2)
+            resp = requests.get(
+                FRANCE_TRAVAIL_SEARCH_URL, params=params, headers=headers, timeout=20
+            )
+            if resp.status_code == 429:
+                log_fn(f"❌ [{dept}] Rate limit persistant, page ignorée.")
+                break
+
+        if resp.status_code in (200, 206):
+            data = resp.json()
+            results = data.get("resultats", [])
+            listings.extend(results)
+            log_fn(f"  [{dept}] start={start} → {len(results)} offres")
+
+            content_range = resp.headers.get("Content-Range", "")
+            try:
+                total = int(content_range.split("/")[1]) if content_range else 0
+            except (IndexError, ValueError):
+                total = 0
+
+            if total and start + page_size >= total:
+                break
+            if len(results) < page_size:
+                break
+            start += page_size
+        else:
+            log_fn(f"❌ [{dept}] HTTP {resp.status_code}")
+            break
+
+    return listings
+
+
+def parse_listing(raw: dict, dept: str, fetched_at: str) -> dict | None:
+    job_id = raw.get("id")
+    title = (raw.get("intitule") or "").strip()
+    description = (raw.get("description") or "").strip()
+
+    if not job_id or not title or not description:
+        return None
+
+    entreprise = raw.get("entreprise") or {}
+    company_name = (entreprise.get("nom") or "Inconnu").strip()
+
+    source_url = (raw.get("origineOffre") or {}).get("urlOrigine") or (
+        f"https://candidat.francetravail.fr/offres/recherche/detail/{job_id}"
+    )
+
+    return {
+        "id": job_id,
+        "source": "france_travail",
+        "source_url": source_url,
+        "title": title,
+        "company_name": company_name,
+        "company_sector": raw.get("secteurActiviteLibelle") or "",
+        "location_text": (raw.get("lieuTravail") or {}).get("libelle") or "",
+        "departement": dept,
+        "contract_type": raw.get("typeContratLibelle") or "",
+        "posted_at": raw.get("dateCreation") or "",
+        "description_raw": description,
+        "description_clean": description.lower().strip(),
+        "salary_text": (raw.get("salaire") or {}).get("libelle") or "",
+        "fetched_at": fetched_at,
+    }
+
+
+def run_fetch(selected_depts: list, log_fn) -> tuple[int, int]:
+    if not CLIENT_ID or not CLIENT_SECRET:
+        st.error("Identifiants manquants — configurez FRANCE_TRAVAIL_CLIENT_ID et CLIENT_SECRET.")
+        st.stop()
+
+    token = get_token()
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    total_new = 0
+    total_scored = 0
+
+    for dept in selected_depts:
+        log_fn(f"📡 Département {DEPT_LABELS.get(dept, dept)}...")
+        listings = fetch_dept(dept, since, token, log_fn)
+        log_fn(f"  → {len(listings)} offres récupérées")
+
+        for raw in listings:
+            job = parse_listing(raw, dept, fetched_at)
+            if job is None:
+                continue
+
+            inserted = insert_job(job)
+            if not inserted:
+                continue
+
+            total_new += 1
+            result = score_job(job["title"], job["description_clean"])
+
+            hypothesis = generate_hypothesis(
+                result["_rep_matches"], result["_struct_matches"],
+                result["_output_matches"], job["title"], job["company_name"],
+            )
+            offer_angle = generate_offer_angle(
+                result["automation_score"], result["_rep_matches"], result["_struct_matches"],
+            )
+
+            insert_score({
+                "job_id": job["id"],
+                "automation_score": result["automation_score"],
+                "repetitive_signal_score": result["repetitive_signal_score"],
+                "structured_input_score": result["structured_input_score"],
+                "measurable_output_score": result["measurable_output_score"],
+                "human_judgment_penalty": result["human_judgment_penalty"],
+                "matched_signals": result["matched_signals"],
+                "hypothesis": hypothesis,
+                "offer_angle": offer_angle,
+            })
+            insert_review_queue(job["id"])
+            total_scored += 1
+
+    return total_new, total_scored
+
+
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def score_badge(score: int) -> str:
+    if score >= SCORE_HIGH:
+        return f"🟢 {score}"
+    elif score >= SCORE_MODERATE:
+        return f"🟠 {score}"
+    return f"🔴 {score}"
+
+
+def truncate(text: str, n: int = 120) -> str:
+    if not text:
+        return ""
+    return text[:n] + "…" if len(text) > n else text
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+
+st.title("Leads Automation — PACA")
+
+stats = get_stats()
+c1, c2, c3 = st.columns(3)
+c1.metric("En attente", stats["pending"])
+c2.metric("Approuvés", stats["approved"])
+c3.metric("Dernière collecte", stats["last_fetch"] or "jamais")
+
+st.divider()
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("Collecte")
+
+    fetch_depts = st.multiselect(
+        "Départements à collecter",
+        options=DEPARTEMENTS,
+        default=DEPARTEMENTS,
+        format_func=lambda d: DEPT_LABELS.get(d, d),
+    )
+
+    if st.button("🔄 Collecter les nouvelles offres", type="primary", use_container_width=True):
+        if not fetch_depts:
+            st.warning("Sélectionnez au moins un département.")
+        else:
+            log_lines = []
+            log_box = st.empty()
+
+            def log(msg):
+                log_lines.append(msg)
+                log_box.text("\n".join(log_lines[-30:]))
+
+            with st.spinner("Collecte en cours..."):
+                new_count, scored_count = run_fetch(fetch_depts, log)
+
+            st.success(f"✅ {new_count} nouvelles offres ajoutées, {scored_count} scorées.")
+            st.rerun()
+
+    st.divider()
+    st.header("Filtres")
+
+    min_score = st.slider("Score minimum", 0, 100, 60, step=5)
+
+    filter_depts = st.multiselect(
+        "Département",
+        options=DEPARTEMENTS,
+        default=DEPARTEMENTS,
+        format_func=lambda d: DEPT_LABELS.get(d, d),
+        key="filter_depts",
+    )
+
+    status_options = ["pending", "approved", "rejected", "snoozed"]
+    selected_statuses = st.multiselect(
+        "Statut",
+        options=status_options,
+        default=["pending"],
+    )
+
+    show_low_fit = st.toggle("Afficher les leads faible potentiel (<60)", value=False)
+
+# ── Lead list ─────────────────────────────────────────────────────────────────
+
+leads = get_leads(
+    min_score=min_score,
+    departements=filter_depts or None,
+    statuses=selected_statuses or None,
+    include_low_fit=show_low_fit,
+)
+
+st.subheader(f"{len(leads)} lead(s) trouvé(s)")
+
+if not leads:
+    st.info("Aucun lead. Utilisez le bouton **Collecter** dans la barre latérale.")
+    st.stop()
+
+for lead in leads:
+    score = lead["automation_score"] or 0
+    try:
+        signals = json.loads(lead.get("matched_signals") or "[]")
+    except Exception:
+        signals = []
+    top_signals = ", ".join(signals[:4]) or "—"
+    status = lead.get("status") or "pending"
+
+    label = (
+        f"{score_badge(score)} — **{lead['company_name'] or 'Inconnu'}** | "
+        f"{lead['title']} | {lead['location_text'] or ''} | `{status.upper()}`"
+    )
+
+    with st.expander(label):
+        col_left, col_right = st.columns([2, 1])
+
+        with col_left:
+            st.markdown(f"**Secteur :** {lead.get('company_sector') or '—'}")
+            st.markdown(f"**Département :** {DEPT_LABELS.get(lead.get('departement'), lead.get('departement') or '—')}")
+            st.markdown(f"**Contrat :** {lead.get('contract_type') or '—'}")
+            st.markdown(f"**Publié le :** {lead.get('posted_at') or '—'}")
+            if lead.get("source_url"):
+                st.markdown(f"[Voir l'offre ↗]({lead['source_url']})")
+
+            st.markdown(f"**Signaux :** {top_signals}")
+
+            hypothesis = lead.get("hypothesis") or ""
+            st.markdown("**Hypothèse :**")
+            st.markdown(truncate(hypothesis, 300))
+            if len(hypothesis) > 300:
+                with st.popover("Lire la suite"):
+                    st.write(hypothesis)
+
+            st.markdown(f"**Angle :** {lead.get('offer_angle') or '—'}")
+
+            with st.expander("Description complète"):
+                st.text(get_job_description(lead["id"]))
+
+        with col_right:
+            st.markdown("**Scores détaillés**")
+            st.markdown(f"- Répétitif : {lead.get('repetitive_signal_score', 0)}")
+            st.markdown(f"- Structuré : {lead.get('structured_input_score', 0)}")
+            st.markdown(f"- Mesurable : {lead.get('measurable_output_score', 0)}")
+            st.markdown(f"- Pénalité : -{lead.get('human_judgment_penalty', 0)}")
+            st.markdown(f"- **Total : {score}**")
+
+        st.markdown("---")
+        notes_key = f"notes_{lead['id']}"
+        notes = st.text_area("Notes", value=lead.get("reviewer_notes") or "", key=notes_key, height=70)
+
+        b1, b2, b3 = st.columns(3)
+        if b1.button("✅ Approuver", key=f"approve_{lead['id']}", type="primary"):
+            update_review_status(lead["id"], "approved", notes)
+            st.rerun()
+        if b2.button("❌ Rejeter", key=f"reject_{lead['id']}"):
+            update_review_status(lead["id"], "rejected", notes)
+            st.rerun()
+        if b3.button("⏸ Snooze", key=f"snooze_{lead['id']}"):
+            update_review_status(lead["id"], "snoozed", notes)
+            st.rerun()
+
+# ── Export ────────────────────────────────────────────────────────────────────
+
+st.divider()
+if st.button("📥 Exporter les leads approuvés (CSV)"):
+    approved = get_approved_leads_for_export()
+    if not approved:
+        st.warning("Aucun lead approuvé à exporter.")
+    else:
+        output = io.StringIO()
+        fieldnames = [
+            "company_name", "title", "location_text", "company_sector",
+            "automation_score", "matched_signals", "hypothesis",
+            "offer_angle", "source_url", "status", "reviewer_notes", "posted_at",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(approved)
+        st.download_button(
+            label="Télécharger leads_approuves.csv",
+            data=output.getvalue(),
+            file_name="leads_approuves.csv",
+            mime="text/csv",
+        )
