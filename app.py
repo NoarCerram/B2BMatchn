@@ -41,18 +41,22 @@ def get_token() -> str:
         FRANCE_TRAVAIL_TOKEN_URL,
         data={
             "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
             "scope": "api_offresdemploiv2 o2dsoffre",
         },
+        auth=(CLIENT_ID, CLIENT_SECRET),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=15,
     )
-    if resp.status_code == 401:
-        st.error("Erreur 401 — Identifiants France Travail invalides. Vérifiez vos secrets.")
+    if resp.status_code != 200:
+        st.error(
+            f"Erreur token France Travail — HTTP {resp.status_code}\n\n"
+            f"Réponse : {resp.text[:500]}"
+        )
         st.stop()
-    resp.raise_for_status()
     data = resp.json()
+    if "access_token" not in data:
+        st.error(f"Réponse token inattendue : {str(data)[:500]}")
+        st.stop()
     st.session_state.ft_token = data["access_token"]
     st.session_state.ft_token_expires = now + TOKEN_TTL
     return st.session_state.ft_token
