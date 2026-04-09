@@ -310,7 +310,6 @@ st.subheader(f"{len(leads)} lead(s) trouvé(s)")
 
 if not leads:
     st.info("Aucun lead. Utilisez le bouton **Collecter** dans la barre latérale.")
-    st.stop()
 
 for lead in leads:
     score = lead["automation_score"] or 0
