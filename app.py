@@ -1,6 +1,7 @@
 import json
 import csv
 import io
+import re
 import time
 import requests
 from datetime import datetime, timedelta, timezone
@@ -381,18 +382,52 @@ if st.button("📥 Exporter les leads approuvés (CSV)"):
     if not approved:
         st.warning("Aucun lead approuvé à exporter.")
     else:
-        output = io.StringIO()
+        def extract_emails(text: str) -> str:
+            return " | ".join(re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text or ""))
+
+        def extract_phones(text: str) -> str:
+            pattern = r"(?:(?:\+|00)33[\s.\-]?|0)[1-9](?:[\s.\-]?\d{2}){4}"
+            return " | ".join(re.findall(pattern, text or ""))
+
+        def extract_websites(text: str) -> str:
+            return " | ".join(re.findall(r"https?://[^\s\"'<>]+", text or ""))
+
+        def clean(text: str) -> str:
+            return re.sub(r"[\r\n]+", " ", text or "").strip()
+
         fieldnames = [
-            "company_name", "title", "location_text", "company_sector",
-            "automation_score", "matched_signals", "hypothesis",
-            "offer_angle", "source_url", "status", "reviewer_notes", "posted_at",
+            "Entreprise", "Poste", "Lieu", "Secteur",
+            "Lien offre", "Publié le",
+            "Email", "Téléphone", "Site web",
+            "Score automation", "Signaux", "Hypothèse", "Angle",
+            "Notes",
         ]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
+
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         writer.writeheader()
-        writer.writerows(approved)
+        for row in approved:
+            desc = row.get("description_raw") or ""
+            writer.writerow({
+                "Entreprise": clean(row.get("company_name")),
+                "Poste": clean(row.get("title")),
+                "Lieu": clean(row.get("location_text")),
+                "Secteur": clean(row.get("company_sector")),
+                "Lien offre": row.get("source_url") or "",
+                "Publié le": row.get("posted_at") or "",
+                "Email": extract_emails(desc),
+                "Téléphone": extract_phones(desc),
+                "Site web": extract_websites(desc),
+                "Score automation": row.get("automation_score") or "",
+                "Signaux": clean(row.get("matched_signals")),
+                "Hypothèse": clean(row.get("hypothesis")),
+                "Angle": clean(row.get("offer_angle")),
+                "Notes": clean(row.get("reviewer_notes")),
+            })
+
         st.download_button(
             label="Télécharger leads_approuves.csv",
-            data=output.getvalue(),
+            data=output.getvalue().encode("utf-8-sig"),
             file_name="leads_approuves.csv",
             mime="text/csv",
         )

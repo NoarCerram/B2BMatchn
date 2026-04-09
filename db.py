@@ -192,9 +192,10 @@ def get_approved_leads_for_export() -> list:
     cur.execute("""
         SELECT
             j.company_name, j.title, j.location_text, j.company_sector,
+            j.source_url, j.posted_at, j.description_raw,
             ls.automation_score, ls.matched_signals, ls.hypothesis,
-            ls.offer_angle, j.source_url,
-            rq.status, rq.reviewer_notes, j.posted_at
+            ls.offer_angle,
+            rq.reviewer_notes
         FROM jobs j
         JOIN lead_scores ls ON ls.job_id = j.id
         JOIN review_queue rq ON rq.job_id = j.id
