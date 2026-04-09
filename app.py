@@ -64,7 +64,7 @@ def get_token() -> str:
     return st.session_state.ft_token
 
 
-def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
+def fetch_dept(dept: str, min_date: str, max_date: str, token: str, log_fn) -> list:
     listings = []
     start = 0
     page_size = 150
@@ -73,6 +73,7 @@ def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
         params = {
             "departement": dept,
             "minCreationDate": min_date,
+            "maxCreationDate": max_date,
         }
         headers = {
             "Authorization": f"Bearer {token}",
@@ -161,15 +162,17 @@ def run_fetch(selected_depts: list, log_fn) -> tuple[int, int]:
         st.stop()
 
     token = get_token()
-    since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fetched_at = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    since = (now_dt - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    fetched_at = now_dt.isoformat()
 
     total_new = 0
     total_scored = 0
 
     for dept in selected_depts:
         log_fn(f"📡 Département {DEPT_LABELS.get(dept, dept)}...")
-        listings = fetch_dept(dept, since, token, log_fn)
+        listings = fetch_dept(dept, since, until, token, log_fn)
         log_fn(f"  → {len(listings)} offres récupérées")
 
         for raw in listings:
