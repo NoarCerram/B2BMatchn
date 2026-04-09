@@ -75,6 +75,7 @@ def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
         headers = {
             "Authorization": f"Bearer {token}",
             "Range": f"offres={start}-{start + page_size - 1}",
+            "Accept": "application/json",
         }
 
         resp = requests.get(
@@ -113,7 +114,7 @@ def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
                 break
             start += page_size
         else:
-            log_fn(f"❌ [{dept}] HTTP {resp.status_code}: {resp.text[:200]}")
+            log_fn(f"❌ [{dept}] HTTP {resp.status_code}: {resp.text[:500]}")
             break
 
     return listings
