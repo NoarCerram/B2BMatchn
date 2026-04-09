@@ -71,9 +71,11 @@ def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
         params = {
             "departement": dept,
             "minCreationDate": min_date,
-            "range": f"{start}-{start + page_size - 1}",
         }
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Range": f"offres={start}-{start + page_size - 1}",
+        }
 
         resp = requests.get(
             FRANCE_TRAVAIL_SEARCH_URL, params=params, headers=headers, timeout=20
@@ -111,7 +113,7 @@ def fetch_dept(dept: str, min_date: str, token: str, log_fn) -> list:
                 break
             start += page_size
         else:
-            log_fn(f"❌ [{dept}] HTTP {resp.status_code}")
+            log_fn(f"❌ [{dept}] HTTP {resp.status_code}: {resp.text[:200]}")
             break
 
     return listings
