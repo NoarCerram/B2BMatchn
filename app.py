@@ -30,6 +30,8 @@ st.set_page_config(page_title="Leads Automation — PACA", layout="wide")
 if "ft_token" not in st.session_state:
     st.session_state.ft_token = None
     st.session_state.ft_token_expires = 0.0
+if "collect_log" not in st.session_state:
+    st.session_state.collect_log = []
 
 
 def get_token() -> str:
@@ -251,17 +253,23 @@ with st.sidebar:
         if not fetch_depts:
             st.warning("Sélectionnez au moins un département.")
         else:
-            log_lines = []
+            st.session_state.collect_log = []
             log_box = st.empty()
 
             def log(msg):
-                log_lines.append(msg)
-                log_box.text("\n".join(log_lines[-30:]))
+                st.session_state.collect_log.append(msg)
+                log_box.text("\n".join(st.session_state.collect_log[-30:]))
 
             with st.spinner("Collecte en cours..."):
                 new_count, scored_count = run_fetch(fetch_depts, log)
 
             st.success(f"✅ {new_count} nouvelles offres ajoutées, {scored_count} scorées.")
+            st.rerun()
+
+    if st.session_state.collect_log:
+        st.text_area("Journal", "\n".join(st.session_state.collect_log), height=200)
+        if st.button("Effacer le journal"):
+            st.session_state.collect_log = []
             st.rerun()
 
     st.divider()
